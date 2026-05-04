@@ -39,6 +39,22 @@ from model_pipeline import (
 PROJECT_DIR = Path(r"C:\Users\Suryansh\OneDrive\Desktop\FraudShield")
 APP_DATASET_NAME = "credit_fraud_284k.csv"
 APP_DATASET_PATH = PROJECT_DIR / APP_DATASET_NAME
+DEFAULT_TRANSACTION_HOUR = 12
+DEFAULT_IS_FOREIGN_TRANSACTION = 0
+DEFAULT_PREV_FRAUD_FLAG = 0
+DEFAULT_MERCHANT_DISTANCE_KM = 0.0
+AGE_RISK_MIN = 16
+AGE_RISK_MAX = 55
+AGE_RISK_BASE_BOOST = 0.55
+AGE_RISK_STEP_BOOST = 0.02
+AGE_RISK_MAX_BOOST = 0.95
+HIDDEN_LIVE_FEATURES = {
+    "is_foreign_transaction",
+    "transaction_hour",
+    "prev_fraud_flag",
+    "merchant_distance_km",
+    "Time",
+}
 
 if DATASET_PATH != APP_DATASET_PATH:
     raise RuntimeError(
@@ -695,6 +711,8 @@ def manual_input_form() -> tuple[bool, dict[str, float | int]]:
                 step=100.0,
                 format="%.2f",
             )
+
+        with col2:
             account_balance = st.number_input(
                 "Account Balance / Ledger Amount",
                 min_value=0.0,
@@ -708,32 +726,11 @@ def manual_input_form() -> tuple[bool, dict[str, float | int]]:
                 value=5,
                 step=1,
             )
-            transaction_time_label = st.selectbox(
-                "Transaction Time",
-                [hour_label(hour) for hour in range(24)],
-                index=12,
-            )
-            transaction_hour = parse_hour_label(transaction_time_label)
 
-        with col2:
-            is_foreign_transaction_label = st.selectbox(
-                "Foreign Transaction?",
-                ["No", "Yes"],
-            )
-            prev_fraud_flag_label = st.selectbox(
-                "Previous Fraud Flag?",
-                ["No", "Yes"],
-            )
-            merchant_distance_km = st.number_input(
-                "Merchant Distance KM",
-                min_value=0.0,
-                value=100.0,
-                step=10.0,
-                format="%.2f",
-            )
-
-        is_foreign_transaction = 1 if is_foreign_transaction_label == "Yes" else 0
-        prev_fraud_flag = 1 if prev_fraud_flag_label == "Yes" else 0
+        transaction_hour = DEFAULT_TRANSACTION_HOUR
+        is_foreign_transaction = DEFAULT_IS_FOREIGN_TRANSACTION
+        prev_fraud_flag = DEFAULT_PREV_FRAUD_FLAG
+        merchant_distance_km = DEFAULT_MERCHANT_DISTANCE_KM
         merchant_risk_score = calculate_merchant_risk_score(
             amount=float(amount),
             account_balance=float(account_balance),
@@ -778,6 +775,30 @@ def render_prediction(prediction: int, probability: float) -> str:
     return "Legitimate"
 
 
+def apply_age_risk_adjustment(
+    values: dict[str, float | int],
+    prediction: int,
+    probability: float,
+) -> tuple[int, float]:
+    """Apply a variable fraud-risk boost for ages outside the live-check range."""
+    age = int(values["age"])
+    if AGE_RISK_MIN <= age <= AGE_RISK_MAX:
+        return prediction, probability
+
+    if age < AGE_RISK_MIN:
+        age_distance = AGE_RISK_MIN - age
+    else:
+        age_distance = age - AGE_RISK_MAX
+
+    age_boost = min(
+        AGE_RISK_BASE_BOOST + (age_distance * AGE_RISK_STEP_BOOST),
+        AGE_RISK_MAX_BOOST,
+    )
+    adjusted_probability = probability + ((1.0 - probability) * age_boost)
+    adjusted_prediction = 1 if adjusted_probability >= 0.5 else prediction
+    return adjusted_prediction, adjusted_probability
+
+
 def add_history_row(
     values: dict[str, float | int],
     predicted_class: str,
@@ -791,7 +812,6 @@ def add_history_row(
     row = dict(values)
     row["Current"] = "Yes"
     row["Check"] = st.session_state.latest_manual_check_id
-    row["Transaction Time"] = hour_label(int(values["transaction_hour"]))
     row["Predicted Class"] = predicted_class
     row["Fraud Probability"] = probability
     st.session_state.manual_transaction_history.append(row)
@@ -804,31 +824,26 @@ def render_history() -> None:
 
     st.markdown("#### Transaction Details History")
     history = pd.DataFrame(st.session_state.manual_transaction_history)
+    visible_feature_columns = [
+        column for column in FEATURE_COLUMNS if column not in HIDDEN_LIVE_FEATURES
+    ]
     ordered_columns = [
         "Current",
         "Check",
         "Predicted Class",
         "Fraud Probability",
-        "Transaction Time",
-        *FEATURE_COLUMNS,
+        *visible_feature_columns,
     ]
     history = history[ordered_columns].sort_values("Check", ascending=False)
     history = history.rename(
         columns={
             "account_balance": "Account Balance",
             "num_transactions_today": "Today Transaction Frequency",
-            "is_foreign_transaction": "Foreign Transaction",
-            "transaction_hour": "Transaction Hour",
-            "prev_fraud_flag": "Previous Fraud Flag",
-            "merchant_distance_km": "Merchant Distance",
             "merchant_risk_score": "Merchant Risk Score",
             "age": "Age",
             "Amount": "Amount",
-            "Time": "Model Time",
         }
     )
-    for column in ["Foreign Transaction", "Previous Fraud Flag"]:
-        history[column] = history[column].map({1: "Yes", 0: "No"}).fillna(history[column])
 
     def highlight_recent(row: pd.Series) -> list[str]:
         if row["Current"] == "Yes":
@@ -881,6 +896,11 @@ def render_live_fraud_detection() -> None:
             scaled_input = transform_features(input_df, scaler)
             prediction = int(model.predict(scaled_input)[0])
             probability = float(model.predict_proba(scaled_input)[0][1])
+            prediction, probability = apply_age_risk_adjustment(
+                values,
+                prediction,
+                probability,
+            )
             predicted_class = render_prediction(prediction, probability)
             add_history_row(values, predicted_class, probability)
 
